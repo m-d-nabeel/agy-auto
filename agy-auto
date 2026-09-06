@@ -164,7 +164,7 @@ watch_loop() {
   set +e +o pipefail   # a poll loop must never die on a transient non-zero
   local dry="$1"
   local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
-  local scr content tailtxt fast slow hits sig now waited need class err_id is_stall
+  local scr content tailtxt fast slow hits sig now waited need class err_id is_stall fixed
   local fast_re slow_re clean_needed stall_ticks
   fast_re="$(to_re "$PATTERNS")"
   slow_re="$(to_re "$SLOW_PATTERNS")"
@@ -281,15 +281,36 @@ watch_loop() {
 
     if [[ "$dry" == 1 ]]; then
       log "DRY-RUN would send '$CONTINUE_TEXT' [$class, waited ${need}s, streak $((streak+1))]"
-    else
-      if (( is_stall )); then
-        tmux send-keys -t "$SESSION" Escape
-        sleep 0.3
+      last="$now"; last_sig="$sig"; streak=$((streak + 1)); stable=0; first_seen=0
+      continue
+    fi
+
+    if (( is_stall )); then
+      tmux send-keys -t "$SESSION" Escape
+      sleep 0.3
+    fi
+    tmux send-keys -t "$SESSION" -l "$CONTINUE_TEXT"
+    sleep 0.2
+    tmux send-keys -t "$SESSION" Enter
+    log "sent '$CONTINUE_TEXT' [$class, backoff ${need}s, streak $((streak+1))]"
+
+    # A stall a continue actually fixes was a fresh, distinct freeze — not a
+    # repeat of one the last continue failed to fix — so it shouldn't inherit
+    # escalated backoff from an earlier, unrelated recovery. FAST/SLOW keep
+    # the plain pause: the same error text repeating really does mean the
+    # retry isn't working, and backing off there is the right call.
+    if (( is_stall )); then
+      fixed=0
+      for _ in 1 2 3 4 5; do
+        sleep "$POLL"
+        if [[ "$(strip_spinner < <(screen))" != "$content" ]]; then fixed=1; break; fi
+      done
+      if (( fixed )); then
+        log "stall fix confirmed — streak reset"
+        last="$now"; last_sig="$sig"; streak=0; stable=0; first_seen=0
+        continue
       fi
-      tmux send-keys -t "$SESSION" -l "$CONTINUE_TEXT"
-      sleep 0.2
-      tmux send-keys -t "$SESSION" Enter
-      log "sent '$CONTINUE_TEXT' [$class, backoff ${need}s, streak $((streak+1))]"
+    else
       sleep 1.5
     fi
 
