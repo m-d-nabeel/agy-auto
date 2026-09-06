@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+#
+# agy-auto — run agy interactively; auto-send "continue" on recoverable errors.
+#
+#   agy-auto [agy args...]   start (or reattach) — this is all you normally run
+#   agy-auto --status        show session + watcher state
+#   agy-auto --log           tail the decision log
+#   agy-auto --stop          kill session and watcher
+#   agy-auto --dry-run ...   detect and log, but never inject (trial run)
+#
+# You use agy completely normally. A background watcher reads the rendered pane
+# text and types "continue" only when a known error has left the agent stopped.
+# No TUI calibration: "idle" is inferred from screen stability.
+#
+# Three classes trigger a retry:
+#   FAST  — any crash with an Error ID (or the hand-listed PATTERNS). Retry
+#           as soon as the TUI settles.
+#   SLOW  — "verifying your account", rate limits. The server told us to
+#           wait, so hold SLOW_WAIT seconds from when the message appeared.
+#   STALL — the spinner (the animated "still working" glyph every TUI shows)
+#           is on screen but hasn't advanced a single frame in STALL_SECS,
+#           and the box is empty. A finished/idle screen has no spinner, so
+#           this can't fire on you just taking your time to respond.
+#           Escape is sent before "continue" to clear the frozen state.
+# All escalate: each retry without recovery doubles the backoff.
+#
+set -euo pipefail
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agy-auto.conf"
+[[ -r "$CONF" ]] && . "$CONF"
+
+# ---- FAST: retry once the TUI is idle -------------------------------------
+PATTERNS="${AGY_AUTO_PATTERNS:-$(cat <<'EOF'
+network (issue|error) connecting to the server
+agent execution terminated due to error
+EOF
+)}"
+
+# ---- SLOW: server asked us to wait; hold SLOW_WAIT before retrying ---------
+SLOW_PATTERNS="${AGY_AUTO_SLOW_PATTERNS:-$(cat <<'EOF'
+verifying your account
+verifying your account eligibility
+please try again shortly
+rate limit
+overloaded
+EOF
+)}"
+
+POLL="${AGY_AUTO_POLL:-0.4}"
+STALL_SECS="${AGY_AUTO_STALL_SECS:-60}"    # box empty + zero screen change this
+                                           # long after the agent had the turn
+                                           # = silently hung, not "your move"
+STABLE_TICKS="${AGY_AUTO_STABLE:-4}"
+IDLE_TIMEOUT="${AGY_AUTO_IDLE_TIMEOUT:-120}"
+COOLDOWN="${AGY_AUTO_COOLDOWN:-15}"        # base backoff, doubles per retry
+MAX_BACKOFF="${AGY_AUTO_MAX_BACKOFF:-300}" # backoff ceiling
+SLOW_WAIT="${AGY_AUTO_SLOW_WAIT:-60}"      # min hold for SLOW-class messages
+MAX_STREAK="${AGY_AUTO_MAX_STREAK:-8}"
+RECOVER_SECS="${AGY_AUTO_RECOVER_SECS:-90}" # clean time that resets the streak
+SCROLLBACK="${AGY_AUTO_SCROLLBACK:-80}"
+TAIL_LINES="${AGY_AUTO_TAIL_LINES:-12}"    # error must be within the last N
+                                           # non-blank lines to count as live
+CONTINUE_TEXT="${AGY_AUTO_CONTINUE_TEXT:-continue}"
+# ---------------------------------------------------------------------------
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/agy-auto"
+mkdir -p "$RUN_DIR"
+
+SESSION="agy_$(basename "$PWD" | tr -c 'A-Za-z0-9' _)_$(printf %s "$PWD" | cksum | cut -d' ' -f1)"
+LOGF="$RUN_DIR/$SESSION.log"
+
+log()    { printf '%(%H:%M:%S)T %s\n' -1 "$*" >>"$LOGF"; }
+alive()  { tmux has-session -t "$SESSION" 2>/dev/null; }
+screen() { tmux capture-pane -p -J -S "-$SCROLLBACK" -t "$SESSION" 2>/dev/null; }
+to_re()  { printf '%s' "$1" | grep -v '^[[:space:]]*$' | paste -sd'|'; }
+# Extract candidate error lines immediately preceding the active prompt divider.
+# If the user is currently typing, or if normal output precedes the prompt, outputs nothing.
+live_error_tail() {
+  awk '
+  /^[[:space:]]*$/ { next }
+  /[─\-]{10,}/ { div[num_div++] = NR; lines[NR] = $0; next }
+  { lines[NR] = $0 }
+  END {
+    if (num_div < 2) exit 0
+    top_div = div[num_div - 2]
+    bot_div = div[num_div - 1]
+
+    # Check prompt between dividers
+    prompt = ""
+    for (i = top_div + 1; i < bot_div; i++) {
+      if (lines[i] != "") prompt = prompt lines[i] " "
+    }
+    sub(/^[[:space:]]+/, "", prompt)
+    sub(/[[:space:]]+$/, "", prompt)
+
+    # If prompt contains user text (not empty and not bare ">"), user is typing -> do not touch
+    if (prompt != ">" && prompt != "") {
+      exit 0
+    }
+
+    # Grab the last 2 non-empty lines immediately above the top divider
+    count = 0
+    for (i = top_div - 1; i >= 1 && count < 2; i--) {
+      if (lines[i] != "") {
+        cand[count++] = lines[i]
+      }
+    }
+    for (i = count - 1; i >= 0; i--) {
+      print cand[i]
+    }
+  }
+  '
+}
+# True iff the prompt box between the last two dividers is empty (bare ">").
+# Non-empty means you're mid-typing — never touch that.
+prompt_empty() {
+  awk '
+  /^[[:space:]]*$/ { next }
+  /[─\-]{10,}/ { div[num_div++] = NR; lines[NR] = $0; next }
+  { lines[NR] = $0 }
+  END {
+    if (num_div < 2) exit 1
+    top_div = div[num_div - 2]; bot_div = div[num_div - 1]
+    prompt = ""
+    for (i = top_div + 1; i < bot_div; i++) { if (lines[i] != "") prompt = prompt lines[i] " " }
+    sub(/^[[:space:]]+/, "", prompt); sub(/[[:space:]]+$/, "", prompt)
+    exit (prompt == ">" || prompt == "") ? 0 : 1
+  }
+  '
+}
+# True iff a braille spinner glyph (U+2800-28FF) is visible near the bottom of
+# the pane — the generic "agent is actively working" indicator every one of
+# these TUIs uses, regardless of the word next to it ("Working", "Loading"...).
+# A finished/idle screen has no spinner at all, so this can't fire on a normal
+# "task's done, waiting for your next request" pause — only on a genuine
+# mid-turn freeze where the spinner itself stops advancing.
+spinner_active() { tail -n 15 | grep -qP '[\x{2800}-\x{28FF}]'; }
+# Drop any line carrying the spinner glyph before comparing screens for
+# staleness: the animation is a client-side heartbeat that keeps ticking on
+# its own even after generation has actually died, so by itself it must never
+# count as "the screen changed." Only real content growing counts.
+strip_spinner() { grep -vP '[\x{2800}-\x{28FF}]'; }
+
+# tmux defaults degrade a modern terminal: modified keys (Shift+Enter) lose
+# their modifier and arrive as a bare CR, and truecolor is quantised. Advertise
+# what the outer terminal can actually do. Server-scoped, applied idempotently.
+tmux_tune() {
+  local t="${TERM:-xterm}"
+  tmux set-option -s  extended-keys on             2>/dev/null || true
+  tmux set-option -s  extended-keys-format csi-u  2>/dev/null || true
+  tmux set-option -s  escape-time 10              2>/dev/null || true
+  tmux set-option -sa terminal-features "xterm*:extkeys:RGB:clipboard:focus:title" 2>/dev/null || true
+  tmux set-option -sa terminal-features "*kitty*:extkeys:RGB:clipboard:focus:title" 2>/dev/null || true
+  tmux set-option -sa terminal-features "*:extkeys" 2>/dev/null || true
+  [[ "${COLORTERM:-}" == truecolor || "${COLORTERM:-}" == 24bit ]] &&
+    tmux set-option -sa terminal-features '*:RGB' 2>/dev/null || true
+  tmux set-option -g  allow-passthrough on 2>/dev/null || true
+  tmux set-option -g  aggressive-resize on  2>/dev/null || true
+  tmux set-option -g  history-limit 50000   2>/dev/null || true
+  tmux bind-key -n S-Enter send-keys Escape "[13;2u" 2>/dev/null || true
+}
+
+watch_loop() {
+  set +e +o pipefail   # a poll loop must never die on a transient non-zero
+  local dry="$1"
+  local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
+  local scr content tailtxt fast slow hits sig now waited need class err_id is_stall
+  local fast_re slow_re clean_needed stall_ticks
+  fast_re="$(to_re "$PATTERNS")"
+  slow_re="$(to_re "$SLOW_PATTERNS")"
+  clean_needed=$(awk -v p="$POLL" -v s="$RECOVER_SECS" 'BEGIN{n=int(s/p); print (n<1?1:n)}')
+  stall_ticks=$(awk -v p="$POLL" -v s="$STALL_SECS" 'BEGIN{n=int(s/p); print (n<1?1:n)}')
+
+  log "watcher start (dry=$dry)"
+  log "  fast: $fast_re"
+  log "  slow: $slow_re"
+  log "  stall: spinner frozen (box empty, unchanged) for ${STALL_SECS}s"
+
+  while alive; do
+    sleep "$POLL"
+    scr="$(screen)" || continue
+    content="$(strip_spinner <<<"$scr" || true)"
+
+    if [[ "$content" == "$prev" ]]; then stable=$((stable + 1)); else stable=0; prev="$content"; fi
+
+    tailtxt="$(live_error_tail <<<"$scr" || true)"
+    err_id=""; fast=""; slow=""; is_stall=0
+    if [[ -n "$tailtxt" ]]; then
+      # Error ID is the real generic signal: agy stamps one on every crash,
+      # regardless of wording. Check it first so unlisted error text still
+      # gets caught instead of relying on PATTERNS staying up to date.
+      err_id="$(grep -Eia 'error id:[[:space:]]*[0-9a-f-]+' <<<"$tailtxt" | tail -1 || true)"
+      fast="$(grep -Eia "$fast_re" <<<"$tailtxt" | tail -1 || true)"
+      slow="$(grep -Eia "$slow_re" <<<"$tailtxt" | tail -1 || true)"
+      [[ -z "$fast$slow" && -n "$err_id" ]] && fast="$err_id"
+    fi
+    hits="$fast$slow"
+
+    # No error text. Still check for a silent stall: a spinner is visible
+    # (the agent is supposedly still working, not waiting on you) and the
+    # screen hasn't moved a single byte for STALL_SECS — the spinner itself
+    # froze. A normal "task's done, your turn" screen has no spinner at all,
+    # so it can never trip this no matter how long it sits idle.
+    if [[ -z "$hits" ]] && (( stable >= stall_ticks )) && spinner_active <<<"$scr" && prompt_empty <<<"$scr"; then
+      is_stall=1
+      hits="STALL:$(tail -n 15 <<<"$scr" | grep -P '[\x{2800}-\x{28FF}]' | tail -1)"
+    fi
+
+    if [[ -z "$hits" ]]; then
+      clean=$((clean + 1))
+      first_seen=0
+      if (( clean >= clean_needed )) && (( streak > 0 )); then
+        log "recovered — streak reset"; streak=0; clean=0; last_sig=""
+      fi
+      continue
+    fi
+
+    clean=0
+    now="$(printf '%(%s)T' -1)"
+
+    # Error ID (already captured above) and previous continue count ensure a
+    # genuinely new failure is distinguishable from the same one still on screen.
+    sig="$(printf '%s\n%s\n%s' "$hits" "$err_id" "$(grep -c '> continue' <<<"$scr")" | cksum)"
+
+    # Deduplication: If we ALREADY injected continue for this error attempt,
+    # DO NOT inject again! Wait for agy to either recover or fail with a new attempt.
+    if [[ "$sig" == "$last_sig" ]]; then
+      continue
+    fi
+
+    (( first_seen == 0 )) && { first_seen="$now"; log "detected: $(head -1 <<<"$hits")"; }
+
+    if (( is_stall )); then class=stall
+    elif [[ -n "$slow" ]]; then class=slow
+    else class=fast; fi
+
+    need=$(awk -v c="$COOLDOWN" -v s="$streak" -v m="$MAX_BACKOFF" \
+           'BEGIN{v=c*(2^s); print (v>m?m:v)}')
+    if [[ "$class" == slow ]] && (( need < SLOW_WAIT )); then need="$SLOW_WAIT"; fi
+
+    if [[ "$class" == slow ]]; then
+      (( now - first_seen < need )) && continue
+    fi
+    (( last > 0 && now - last < need )) && continue
+
+    if (( streak >= MAX_STREAK )); then
+      tmux display-message -d 8000 -t "$SESSION" \
+        "agy-auto paused: $MAX_STREAK retries without recovery — take over." 2>/dev/null || true
+      log "PAUSED after $MAX_STREAK retries without recovery"
+      streak=0; last="$now"; first_seen="$now"; last_sig="$sig"
+      continue
+    fi
+
+    # Let the TUI settle before typing into it.
+    waited=0
+    while (( stable < STABLE_TICKS )) && alive; do
+      sleep "$POLL"
+      scr="$(screen)" || break
+      content="$(strip_spinner <<<"$scr" || true)"
+      if [[ "$content" == "$prev" ]]; then stable=$((stable + 1)); else stable=0; prev="$content"; fi
+      waited=$((waited + 1))
+      (( waited > IDLE_TIMEOUT * 2 )) && { log "idle wait timed out; sending anyway"; break; }
+    done
+    alive || break
+
+    # Final safety check: re-verify the condition is STILL true, not resolved
+    # while we waited for the TUI to settle. Compare spinner-stripped content
+    # here too — the glyph alone changing must not look like "it recovered."
+    if (( is_stall )); then
+      if [[ "$(strip_spinner < <(screen))" != "$content" ]]; then
+        log "stall cleared while waiting for idle — aborting injection"
+        continue
+      fi
+    else
+      tailtxt="$(live_error_tail <<<"$scr" || true)"
+      if [[ -z "$tailtxt" ]] || ! grep -Eqia "$fast_re|$slow_re" <<<"$tailtxt"; then
+        log "error cleared or superseded while waiting for idle — aborting injection"
+        continue
+      fi
+    fi
+
+    if [[ "$dry" == 1 ]]; then
+      log "DRY-RUN would send '$CONTINUE_TEXT' [$class, waited ${need}s, streak $((streak+1))]"
+    else
+      if (( is_stall )); then
+        tmux send-keys -t "$SESSION" Escape
+        sleep 0.3
+      fi
+      tmux send-keys -t "$SESSION" -l "$CONTINUE_TEXT"
+      sleep 0.2
+      tmux send-keys -t "$SESSION" Enter
+      log "sent '$CONTINUE_TEXT' [$class, backoff ${need}s, streak $((streak+1))]"
+      sleep 1.5
+    fi
+
+    last="$now"; last_sig="$sig"; streak=$((streak + 1)); stable=0; first_seen=0
+  done
+  log "watcher exit"
+}
+
+case "${1:-}" in
+  --watch)
+    while alive; do
+      watch_loop "${2:-0}"
+      alive || break
+      log "watcher exited unexpectedly — restarting in 2s"
+      sleep 2
+    done
+    log "watcher stopped (session gone)"
+    exit 0 ;;
+  --status)
+    alive && echo "session $SESSION: running" || echo "session $SESSION: not running"
+    if pgrep -af 'agy-auto --watch' >/dev/null; then
+      echo "watcher: running  ($(pgrep -f 'agy-auto --watch' | tr '\n' ' '))"
+    else
+      echo "watcher: NOT RUNNING"
+    fi
+    printf 'extended-keys: %s (%s)   TERM=%s\n' \
+      "$(tmux show-options -sqv extended-keys 2>/dev/null)" \
+      "$(tmux show-options -sqv extended-keys-format 2>/dev/null)" "${TERM:-?}"
+    [[ -r "$LOGF" ]] && { echo "--- recent ---"; tail -n 10 "$LOGF"; }
+    exit 0 ;;
+  --log)     tail -n 40 -f "$LOGF" 2>/dev/null || echo "no log yet"; exit 0 ;;
+  --stop)    tmux kill-session -t "$SESSION" 2>/dev/null && echo stopped || echo "not running"; exit 0 ;;
+  --dry-run) DRY=1; shift ;;
+  *)         DRY=0 ;;
+esac
+
+command -v tmux >/dev/null || { echo "agy-auto: tmux is required" >&2; exit 1; }
+command -v agy  >/dev/null || { echo "agy-auto: agy not on PATH" >&2; exit 1; }
+
+if ! alive; then
+  : >"$LOGF"
+  tmux start-server 2>/dev/null || true
+  tmux_tune
+  tmux new-session -d -s "$SESSION" -c "$PWD" -x "$(tput cols)" -y "$(tput lines)" "agy $*"
+  tmux_tune
+  tmux set-option -t "$SESSION" -q status off
+  tmux set-option -t "$SESSION" -q window-size latest
+  setsid "$(realpath "$0")" --watch "$DRY" >/dev/null 2>&1 </dev/null &
+  echo "agy-auto: watching (fast retry + slow backoff)   'agy-auto --log' to inspect"
+else
+  tmux_tune
+fi
+
+if [[ -n "${TMUX:-}" ]]; then tmux switch-client -t "$SESSION"
+else tmux attach-session -t "$SESSION"; fi
+
+if alive; then
+  echo "agy-auto: detached — session still running. Re-run here to reattach."
+else
+  echo "agy-auto: agy exited."
+fi
