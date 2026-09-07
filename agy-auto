@@ -165,6 +165,7 @@ watch_loop() {
   local dry="$1"
   local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
   local scr content tailtxt fast slow hits sig now waited need class err_id is_stall fixed
+  local scr2 tailtxt2 still_error still_stall
   local fast_re slow_re clean_needed stall_ticks
   fast_re="$(to_re "$PATTERNS")"
   slow_re="$(to_re "$SLOW_PATTERNS")"
@@ -273,7 +274,11 @@ watch_loop() {
       fi
     else
       tailtxt="$(live_error_tail <<<"$scr" || true)"
-      if [[ -z "$tailtxt" ]] || ! grep -Eqia "$fast_re|$slow_re" <<<"$tailtxt"; then
+      # Same match logic the initial detection used, Error ID fallback
+      # included — otherwise an error caught only via Error ID can never
+      # pass this recheck and would spin here forever without ever sending.
+      if [[ -z "$tailtxt" ]] || { ! grep -Eqia "$fast_re|$slow_re" <<<"$tailtxt" && \
+           ! grep -Eqia 'error id:[[:space:]]*[0-9a-f-]+' <<<"$tailtxt"; }; then
         log "error cleared or superseded while waiting for idle — aborting injection"
         continue
       fi
@@ -294,24 +299,33 @@ watch_loop() {
     tmux send-keys -t "$SESSION" Enter
     log "sent '$CONTINUE_TEXT' [$class, backoff ${need}s, streak $((streak+1))]"
 
-    # A stall a continue actually fixes was a fresh, distinct freeze — not a
-    # repeat of one the last continue failed to fix — so it shouldn't inherit
-    # escalated backoff from an earlier, unrelated recovery. FAST/SLOW keep
-    # the plain pause: the same error text repeating really does mean the
-    # retry isn't working, and backing off there is the right call.
-    if (( is_stall )); then
-      fixed=0
-      for _ in 1 2 3 4 5; do
-        sleep "$POLL"
-        if [[ "$(strip_spinner < <(screen))" != "$content" ]]; then fixed=1; break; fi
-      done
-      if (( fixed )); then
-        log "stall fix confirmed — streak reset"
-        last="$now"; last_sig="$sig"; streak=0; stable=0; first_seen=0
-        continue
+    # A continue that actually clears the condition was a fresh, distinct
+    # incident — not a repeat of one the last continue failed to fix — so it
+    # shouldn't inherit escalated backoff from an earlier, unrelated recovery.
+    # Re-run the SAME structured detection this class came from on the live
+    # view, not a raw byte diff of the whole pane: the identical error simply
+    # reappearing further down the scrollback still counts as "the screen
+    # changed" in raw bytes, which would falsely confirm a repeat as fixed.
+    fixed=0
+    for _ in 1 2 3 4 5; do
+      sleep "$POLL"
+      scr2="$(screen)" || continue
+      tailtxt2="$(live_error_tail <<<"$scr2" || true)"
+      still_error=0
+      if [[ -n "$tailtxt2" ]]; then
+        { grep -Eqia "$fast_re|$slow_re" <<<"$tailtxt2" || \
+          grep -Eqia 'error id:[[:space:]]*[0-9a-f-]+' <<<"$tailtxt2"; } && still_error=1
       fi
-    else
-      sleep 1.5
+      still_stall=0
+      if (( is_stall )) && [[ "$(strip_spinner <<<"$scr2")" == "$content" ]]; then
+        still_stall=1
+      fi
+      if (( ! still_error )) && (( ! still_stall )); then fixed=1; break; fi
+    done
+    if (( fixed )); then
+      log "$class fix confirmed — streak reset"
+      last="$now"; last_sig="$sig"; streak=0; stable=0; first_seen=0
+      continue
     fi
 
     last="$now"; last_sig="$sig"; streak=$((streak + 1)); stable=0; first_seen=0
