@@ -313,6 +313,17 @@ watch_loop() {
       continue
     fi
 
+    # One more check, as close to the actual keystrokes as this polling
+    # model allows: never type over you. This can't be made airtight — two
+    # independent writers with no locking always leaves *some* window — but
+    # a fresh check right here, instead of trusting the diff from a moment
+    # ago, shrinks that window to as small as this script can make it.
+    scr="$(screen)" || scr=""
+    if ! prompt_empty <<<"$scr"; then
+      log "you're typing — aborting injection"
+      continue
+    fi
+
     if (( is_stall )); then
       tmux send-keys -t "$SESSION" Escape
       sleep 0.3
