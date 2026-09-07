@@ -76,8 +76,6 @@ SLOW_WAIT="${AGY_AUTO_SLOW_WAIT:-60}"      # min hold for SLOW-class messages
 MAX_STREAK="${AGY_AUTO_MAX_STREAK:-8}"
 RECOVER_SECS="${AGY_AUTO_RECOVER_SECS:-90}" # clean time that resets the streak
 SCROLLBACK="${AGY_AUTO_SCROLLBACK:-80}"
-TAIL_LINES="${AGY_AUTO_TAIL_LINES:-12}"    # error must be within the last N
-                                           # non-blank lines to count as live
 CONTINUE_TEXT="${AGY_AUTO_CONTINUE_TEXT:-continue}"
 # ---------------------------------------------------------------------------
 
