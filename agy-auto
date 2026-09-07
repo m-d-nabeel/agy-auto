@@ -36,6 +36,14 @@
 #
 set -euo pipefail
 
+# Needs the printf '%()T' strftime builtin (bash >=4.2). macOS ships bash 3.2
+# by default - install a newer one (e.g. `brew install bash`) and run this
+# with that binary instead.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
+  echo "agy-auto: needs bash >= 4.2, found ${BASH_VERSION}" >&2
+  exit 1
+fi
+
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agy-auto.conf"
 [[ -r "$CONF" ]] && . "$CONF"
 
@@ -75,6 +83,11 @@ CONTINUE_TEXT="${AGY_AUTO_CONTINUE_TEXT:-continue}"
 
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/agy-auto"
 mkdir -p "$RUN_DIR"
+
+# Braille spinner glyphs (U+2800-28FF) as a raw UTF-8 byte range, matched under
+# the C locale with plain -E — portable to BSD/macOS grep, unlike \x{...}
+# codepoint escapes which need PCRE (-P, GNU/Linux-only).
+SPINNER_BYTES=$'\xe2[\xa0-\xa3][\x80-\xbf]'
 
 SESSION="agy_$(basename "$PWD" | tr -c 'A-Za-z0-9' _)_$(printf %s "$PWD" | cksum | cut -d' ' -f1)"
 LOGF="$RUN_DIR/$SESSION.log"
@@ -144,12 +157,12 @@ prompt_empty() {
 # A finished/idle screen has no spinner at all, so this can't fire on a normal
 # "task's done, waiting for your next request" pause — only on a genuine
 # mid-turn freeze where the spinner itself stops advancing.
-spinner_active() { tail -n 15 | grep -qP '[\x{2800}-\x{28FF}]'; }
+spinner_active() { tail -n 15 | LC_ALL=C grep -qE "$SPINNER_BYTES"; }
 # Drop any line carrying the spinner glyph before comparing screens for
 # staleness: the animation is a client-side heartbeat that keeps ticking on
 # its own even after generation has actually died, so by itself it must never
 # count as "the screen changed." Only real content growing counts.
-strip_spinner() { grep -vP '[\x{2800}-\x{28FF}]'; }
+strip_spinner() { LC_ALL=C grep -vE "$SPINNER_BYTES"; }
 
 # tmux defaults degrade a modern terminal: modified keys (Shift+Enter) lose
 # their modifier and arrive as a bare CR, and truecolor is quantised. Advertise
@@ -214,7 +227,7 @@ watch_loop() {
     # so it can never trip this no matter how long it sits idle.
     if [[ -z "$hits" ]] && (( stable >= stall_ticks )) && spinner_active <<<"$scr" && prompt_empty <<<"$scr"; then
       is_stall=1
-      hits="STALL:$(tail -n 15 <<<"$scr" | grep -P '[\x{2800}-\x{28FF}]' | tail -1)"
+      hits="STALL:$(tail -n 15 <<<"$scr" | LC_ALL=C grep -E "$SPINNER_BYTES" | tail -1)"
     fi
 
     if [[ -z "$hits" ]]; then
@@ -374,6 +387,14 @@ esac
 command -v tmux >/dev/null || { echo "agy-auto: tmux is required" >&2; exit 1; }
 command -v agy  >/dev/null || { echo "agy-auto: agy not on PATH" >&2; exit 1; }
 
+# Resolve our own path without realpath (not on macOS/BSD by default): $0 as
+# invoked, made absolute if relative, or looked up on PATH if it's a bare name.
+case "$0" in
+  /*) SELF="$0" ;;
+  */*) SELF="$PWD/$0" ;;
+  *) SELF="$(command -v "$0")" ;;
+esac
+
 if ! alive; then
   : >"$LOGF"
   tmux start-server 2>/dev/null || true
@@ -382,7 +403,10 @@ if ! alive; then
   tmux_tune
   tmux set-option -t "$SESSION" -q status off
   tmux set-option -t "$SESSION" -q window-size latest
-  setsid "$(realpath "$0")" --watch "$DRY" >/dev/null 2>&1 </dev/null &
+  # nohup+disown instead of setsid (util-linux, not on macOS/BSD): both just
+  # need the watcher to survive this shell exiting once you detach.
+  nohup "$SELF" --watch "$DRY" >/dev/null 2>&1 </dev/null &
+  disown
   echo "agy-auto: watching (fast retry + slow backoff)   'agy-auto --log' to inspect"
 else
   tmux_tune
