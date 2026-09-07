@@ -76,6 +76,7 @@ SLOW_WAIT="${AGY_AUTO_SLOW_WAIT:-60}"      # min hold for SLOW-class messages
 MAX_STREAK="${AGY_AUTO_MAX_STREAK:-8}"
 RECOVER_SECS="${AGY_AUTO_RECOVER_SECS:-90}" # clean time that resets the streak
 SCROLLBACK="${AGY_AUTO_SCROLLBACK:-80}"
+CONFIRM_SECS="${AGY_AUTO_CONFIRM_SECS:-20}" # max wait after sending to confirm it worked
 CONTINUE_TEXT="${AGY_AUTO_CONTINUE_TEXT:-continue}"
 # ---------------------------------------------------------------------------
 
@@ -149,13 +150,14 @@ prompt_empty() {
   }
   '
 }
-# True iff a braille spinner glyph (U+2800-28FF) is visible near the bottom of
-# the pane — the generic "agent is actively working" indicator every one of
-# these TUIs uses, regardless of the word next to it ("Working", "Loading"...).
-# A finished/idle screen has no spinner at all, so this can't fire on a normal
-# "task's done, waiting for your next request" pause — only on a genuine
-# mid-turn freeze where the spinner itself stops advancing.
-spinner_active() { tail -n 15 | LC_ALL=C grep -qE "$SPINNER_BYTES"; }
+# True iff a braille spinner glyph (U+2800-28FF) is visible — the generic
+# "agent is actively working" indicator every one of these TUIs uses,
+# regardless of the word next to it ("Working", "Loading"...). Callers must
+# pass an already divider-scoped region (live_error_tail's output), not the
+# raw pane: a blind tail of the whole capture keeps "seeing" an old frozen
+# spinner line long after real recovery, since a short session's entire
+# transcript can fit inside a fixed trailing-line window.
+spinner_active() { LC_ALL=C grep -qE "$SPINNER_BYTES"; }
 # Drop any line carrying the spinner glyph before comparing screens for
 # staleness: the animation is a client-side heartbeat that keeps ticking on
 # its own even after generation has actually died, so by itself it must never
@@ -186,7 +188,7 @@ watch_loop() {
   local dry="$1"
   local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
   local scr content tailtxt fast slow hits sig now waited need class err_id is_stall fixed
-  local scr2 tailtxt2 still_error still_stall
+  local scr2 tailtxt2 csettle cprev cticks ccontent confirm_max
   local fast_re slow_re clean_needed stall_ticks
   fast_re="$(to_re "$PATTERNS")"
   slow_re="$(to_re "$SLOW_PATTERNS")"
@@ -223,9 +225,9 @@ watch_loop() {
     # screen hasn't moved a single byte for STALL_SECS — the spinner itself
     # froze. A normal "task's done, your turn" screen has no spinner at all,
     # so it can never trip this no matter how long it sits idle.
-    if [[ -z "$hits" ]] && (( stable >= stall_ticks )) && spinner_active <<<"$scr" && prompt_empty <<<"$scr"; then
+    if [[ -z "$hits" ]] && (( stable >= stall_ticks )) && spinner_active <<<"$tailtxt" && prompt_empty <<<"$scr"; then
       is_stall=1
-      hits="STALL:$(tail -n 15 <<<"$scr" | LC_ALL=C grep -E "$SPINNER_BYTES" | tail -1)"
+      hits="STALL:$(LC_ALL=C grep -E "$SPINNER_BYTES" <<<"$tailtxt" | tail -1)"
     fi
 
     if [[ -z "$hits" ]]; then
@@ -323,26 +325,39 @@ watch_loop() {
     # A continue that actually clears the condition was a fresh, distinct
     # incident — not a repeat of one the last continue failed to fix — so it
     # shouldn't inherit escalated backoff from an earlier, unrelated recovery.
-    # Re-run the SAME structured detection this class came from on the live
-    # view, not a raw byte diff of the whole pane: the identical error simply
-    # reappearing further down the scrollback still counts as "the screen
-    # changed" in raw bytes, which would falsely confirm a repeat as fixed.
+    # This needs the screen to genuinely RE-SETTLE, not just differ once: a
+    # persistent problem (e.g. the account is actually out of credits) makes
+    # every retry re-freeze on a *slightly* different render each time — a
+    # one-shot byte diff calls that "fixed" every single time, which lets the
+    # streak reset forever and the MAX_STREAK circuit breaker never trips.
+    # So: wait for it to settle again, then check whether the state it
+    # settled INTO is itself a known-bad one (error text, or frozen spinner).
+    # Sustained activity with no re-freeze for the whole window also counts
+    # as fixed — it's clearly not stuck.
     fixed=0
-    for _ in 1 2 3 4 5; do
+    csettle=0; cprev=""; cticks=0
+    confirm_max=$(awk -v p="$POLL" -v c="$CONFIRM_SECS" 'BEGIN{n=int(c/p); print (n<1?1:n)}')
+    while (( cticks < confirm_max )); do
       sleep "$POLL"
+      cticks=$((cticks + 1))
       scr2="$(screen)" || continue
+      ccontent="$(strip_spinner <<<"$scr2" || true)"
+      if [[ "$ccontent" == "$cprev" ]]; then csettle=$((csettle + 1)); else csettle=0; cprev="$ccontent"; fi
+
       tailtxt2="$(live_error_tail <<<"$scr2" || true)"
-      still_error=0
-      if [[ -n "$tailtxt2" ]]; then
-        { grep -Eqia "$fast_re|$slow_re" <<<"$tailtxt2" || \
-          grep -Eqia 'error id:[[:space:]]*[0-9a-f-]+' <<<"$tailtxt2"; } && still_error=1
+      if [[ -n "$tailtxt2" ]] && { grep -Eqia "$fast_re|$slow_re" <<<"$tailtxt2" || \
+           grep -Eqia 'error id:[[:space:]]*[0-9a-f-]+' <<<"$tailtxt2"; }; then
+        break   # a real error showed up — definitely not fixed
       fi
-      still_stall=0
-      if (( is_stall )) && [[ "$(strip_spinner <<<"$scr2")" == "$content" ]]; then
-        still_stall=1
+
+      if (( csettle >= STABLE_TICKS )); then
+        if spinner_active <<<"$tailtxt2" && prompt_empty <<<"$scr2"; then
+          break   # settled right back into a frozen-spinner state — not fixed
+        fi
+        fixed=1; break   # settled into something that isn't a stall — genuinely fixed
       fi
-      if (( ! still_error )) && (( ! still_stall )); then fixed=1; break; fi
     done
+    (( cticks >= confirm_max )) && fixed=1   # stayed actively changing the whole window
     if (( fixed )); then
       log "$class fix confirmed — streak reset"
       last="$now"; last_sig="$sig"; streak=0; stable=0; first_seen=0
