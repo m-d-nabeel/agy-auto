@@ -326,10 +326,10 @@ watch_loop() {
     # incident — not a repeat of one the last continue failed to fix — so it
     # shouldn't inherit escalated backoff from an earlier, unrelated recovery.
     # This needs the screen to genuinely RE-SETTLE, not just differ once: a
-    # persistent problem (e.g. the account is actually out of credits) makes
-    # every retry re-freeze on a *slightly* different render each time — a
-    # one-shot byte diff calls that "fixed" every single time, which lets the
-    # streak reset forever and the MAX_STREAK circuit breaker never trips.
+    # persistent, not-actually-transient problem makes every retry re-freeze
+    # on a *slightly* different render each time — a one-shot byte diff calls
+    # that "fixed" every single time, which lets the streak reset forever and
+    # the MAX_STREAK circuit breaker never trips.
     # So: wait for it to settle again, then check whether the state it
     # settled INTO is itself a known-bad one (error text, or frozen spinner).
     # Sustained activity with no re-freeze for the whole window also counts
