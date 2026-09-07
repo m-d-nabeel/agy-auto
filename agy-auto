@@ -24,6 +24,16 @@
 #           Escape is sent before "continue" to clear the frozen state.
 # All escalate: each retry without recovery doubles the backoff.
 #
+# If keyboard input ever fully stops responding (e.g. after navigating an
+# overlay) with no error text and no spinner, none of the above can detect
+# it — deliberately: there's no reliable signal to trigger on without risking
+# a false positive on a session that's simply waiting on you. Closing the
+# terminal does NOT fix this; the tmux session survives and you'll reattach
+# to the exact same wedged state. Recover manually instead:
+#   agy-auto --stop && agy-auto --continue [your usual flags]
+# --continue resumes from agy's own persisted conversation state, not tmux,
+# so this is safe even though it kills the stuck session outright.
+#
 set -euo pipefail
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agy-auto.conf"
@@ -146,7 +156,7 @@ strip_spinner() { grep -vP '[\x{2800}-\x{28FF}]'; }
 # what the outer terminal can actually do. Server-scoped, applied idempotently.
 tmux_tune() {
   local t="${TERM:-xterm}"
-  tmux set-option -s  extended-keys on             2>/dev/null || true
+  tmux set-option -s  extended-keys always         2>/dev/null || true
   tmux set-option -s  extended-keys-format csi-u  2>/dev/null || true
   tmux set-option -s  escape-time 10              2>/dev/null || true
   tmux set-option -sa terminal-features "xterm*:extkeys:RGB:clipboard:focus:title" 2>/dev/null || true
