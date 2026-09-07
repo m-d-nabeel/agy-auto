@@ -1,6 +1,6 @@
 # agy-auto
 
-Run `agy` interactively, exactly as normal, while a background watcher clears the recoverable failures for you — network drops, rate limits, and silent mid-turn freezes — by typing `continue` at the right moment. You keep full control of the terminal the whole time.
+Run [`agy`](https://antigravity.google/download#antigravity-cli) interactively, exactly as normal, while a background watcher clears the recoverable failures for you — network drops, rate limits, and silent mid-turn freezes — by typing `continue` at the right moment. You keep full control of the terminal the whole time.
 
 ## Why
 
@@ -32,7 +32,7 @@ Works from any interactive shell (zsh, bash, fish, ...) since it's invoked as a 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/<you>/agy-auto/main/agy-auto -o ~/.local/bin/agy-auto
+curl -fsSL https://raw.githubusercontent.com/m-d-nabeel/agy-auto/main/agy-auto -o ~/.local/bin/agy-auto
 chmod +x ~/.local/bin/agy-auto
 ```
 
