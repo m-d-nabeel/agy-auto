@@ -172,6 +172,10 @@ tmux_tune() {
   tmux set-option -s  extended-keys always         2>/dev/null || true
   tmux set-option -s  extended-keys-format csi-u  2>/dev/null || true
   tmux set-option -s  escape-time 10              2>/dev/null || true
+  # Actually idempotent: -sa only appends, so calling this more than once
+  # (every agy-auto invocation does) would otherwise grow this list forever.
+  # Clear back to tmux's own built-ins first, then rebuild fresh.
+  tmux set-option -su terminal-features 2>/dev/null || true
   tmux set-option -sa terminal-features "xterm*:extkeys:RGB:clipboard:focus:title" 2>/dev/null || true
   tmux set-option -sa terminal-features "*kitty*:extkeys:RGB:clipboard:focus:title" 2>/dev/null || true
   tmux set-option -sa terminal-features "*:extkeys" 2>/dev/null || true
