@@ -168,6 +168,23 @@ agy_health() {
     printf '%s live' "$work"
   fi
 }
+
+# Cheap enough to call every poll (~9ms measured against a real 1000-line
+# log): just line-order comparison, no per-line timestamp parsing. This is
+# the authoritative, direct signal for the actual bug this tool exists to
+# catch — the agent_state feed dying — checked independently of screen
+# state. Prints a signature of the death line if dead, empty if live/unknown.
+stream_dead_sig() {
+  local alog tail_lines died_n started_n
+  alog="$(agy_log)" || { printf ''; return; }
+  tail_lines="$(tail -n 4000 "$alog" 2>/dev/null)" || { printf ''; return; }
+  died_n="$(grep -nE 'Conversation update stream .* failed' <<<"$tail_lines" | tail -1 | cut -d: -f1)"
+  [[ -n "$died_n" ]] || { printf ''; return; }
+  started_n="$(grep -nE 'Starting conversation update stream' <<<"$tail_lines" | tail -1 | cut -d: -f1)"
+  if [[ -z "$started_n" || "$died_n" -gt "$started_n" ]]; then
+    awk -v n="$died_n" 'NR==n' <<<"$tail_lines" | cksum | cut -d' ' -f1
+  fi
+}
 # Extract candidate error lines immediately preceding the active prompt divider.
 # If the user is currently typing, or if normal output precedes the prompt, outputs nothing.
 live_error_tail() {
@@ -265,6 +282,7 @@ watch_loop() {
   local dry="$1"
   local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
   local scr content tailtxt fast slow hits sig now waited need class err_id is_stall fixed
+  local dstreak=0 dlast=0 last_dead_sig="" dsig dneed dfixed
   local scr2 tailtxt2 csettle cprev cticks ccontent confirm_max
   local health hwork hstream send_escape
   local fast_re slow_re clean_needed stall_ticks
@@ -284,6 +302,63 @@ watch_loop() {
     content="$(strip_spinner <<<"$scr" || true)"
 
     if [[ "$content" == "$prev" ]]; then stable=$((stable + 1)); else stable=0; prev="$content"; fi
+
+    # --- Dead update-stream: checked independently, every poll ------------
+    # This is the actual bug this tool exists to catch, not inferred from
+    # screen symptoms: agy's own agent_state feed dies (confirmed live) and
+    # NEVER self-heals on its own — every recovery all day traced back to
+    # our own Escape. Once dead, the screen is fundamentally untrustworthy:
+    # a real incident showed the input box can keep showing stale content
+    # indefinitely, which silently defeated the box-emptiness check that
+    # gates the spinner-based STALL path below. So this does not require
+    # the box to look empty — it uses `stable` (the whole screen is
+    # byte-identical across polls) instead, since actual live typing would
+    # make the screen change; a stale box merely existing does not.
+    if (( HEALTH )) && (( stable >= STABLE_TICKS )); then
+      dsig="$(stream_dead_sig)"
+      if [[ -n "$dsig" && "$dsig" != "$last_dead_sig" ]]; then
+        now="$(printf '%(%s)T' -1)"
+        if (( dstreak >= MAX_STREAK )); then
+          tmux display-message -d 8000 -t "$SESSION" \
+            "agy-auto paused: agy's update-stream keeps dying, $MAX_STREAK retries without recovery — take over." 2>/dev/null || true
+          log "PAUSED (dead-stream) after $MAX_STREAK retries without recovery"
+          dstreak=0; dlast="$now"; last_dead_sig="$dsig"
+          continue
+        fi
+        dneed=$(awk -v c="$COOLDOWN" -v s="$dstreak" -v m="$MAX_BACKOFF" \
+                'BEGIN{v=c*(2^s); print (v>m?m:v)}')
+        if (( dlast == 0 || now - dlast >= dneed )); then
+          log "detected: dead update-stream ($dsig)"
+          if [[ "$dry" == 1 ]]; then
+            log "DRY-RUN would send '$CONTINUE_TEXT' [deadstream, streak $((dstreak+1))]"
+            dlast="$now"; last_dead_sig="$dsig"; dstreak=$((dstreak + 1))
+          else
+            tmux send-keys -t "$SESSION" Escape
+            sleep 0.3
+            tmux send-keys -t "$SESSION" -l "$CONTINUE_TEXT"
+            sleep 0.2
+            tmux send-keys -t "$SESSION" Enter
+            log "sent '$CONTINUE_TEXT' [deadstream, backoff ${dneed}s, streak $((dstreak+1))]"
+            # Confirm against ground truth, not screen bytes: did the feed
+            # actually come back, not just "did something look different."
+            dfixed=0
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              sleep "$POLL"
+              [[ -z "$(stream_dead_sig)" ]] && { dfixed=1; break; }
+            done
+            if (( dfixed )); then
+              log "dead-stream fix confirmed — streak reset"
+              dstreak=0
+            else
+              dstreak=$((dstreak + 1))
+            fi
+            dlast="$now"; last_dead_sig="$dsig"
+          fi
+          stable=0; prev=""
+          continue
+        fi
+      fi
+    fi
 
     tailtxt="$(live_error_tail <<<"$scr" || true)"
     err_id=""; fast=""; slow=""; is_stall=0
