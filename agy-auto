@@ -282,7 +282,7 @@ watch_loop() {
   local dry="$1"
   local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
   local scr content tailtxt fast slow hits sig now waited need class err_id is_stall fixed
-  local dstreak=0 dlast=0 last_dead_sig="" dsig dneed dfixed
+  local dstreak=0 dlast=0 dpaused_sig="" dsig dneed dfixed
   local scr2 tailtxt2 csettle cprev cticks ccontent confirm_max
   local health hwork hstream send_escape
   local fast_re slow_re clean_needed stall_ticks
@@ -316,22 +316,32 @@ watch_loop() {
     # make the screen change; a stale box merely existing does not.
     if (( HEALTH )) && (( stable >= STABLE_TICKS )); then
       dsig="$(stream_dead_sig)"
-      if [[ -n "$dsig" && "$dsig" != "$last_dead_sig" ]]; then
+      # A genuinely different failure supersedes any prior pause, giving it
+      # a fresh chance rather than staying stuck on an old, unrelated verdict.
+      if [[ -n "$dsig" && "$dsig" != "$dpaused_sig" ]]; then
         now="$(printf '%(%s)T' -1)"
         if (( dstreak >= MAX_STREAK )); then
           tmux display-message -d 8000 -t "$SESSION" \
             "agy-auto paused: agy's update-stream keeps dying, $MAX_STREAK retries without recovery — take over." 2>/dev/null || true
           log "PAUSED (dead-stream) after $MAX_STREAK retries without recovery"
-          dstreak=0; dlast="$now"; last_dead_sig="$dsig"
+          dpaused_sig="$dsig"; dstreak=0; dlast="$now"
           continue
         fi
         dneed=$(awk -v c="$COOLDOWN" -v s="$dstreak" -v m="$MAX_BACKOFF" \
                 'BEGIN{v=c*(2^s); print (v>m?m:v)}')
+        # Gated purely by the backoff timer, NOT by whether the signature
+        # changed since last time. A death that never resolves keeps the
+        # exact same log line — and therefore the exact same signature —
+        # forever, so requiring it to differ here would silently disable
+        # every retry after the first one. Confirmed live: stream stayed
+        # dead for 4+ minutes after one attempt, then went permanently
+        # silent, because this exact check used to require a fresh sig.
+        # The escalating backoff already prevents spamming on its own.
         if (( dlast == 0 || now - dlast >= dneed )); then
           log "detected: dead update-stream ($dsig)"
           if [[ "$dry" == 1 ]]; then
             log "DRY-RUN would send '$CONTINUE_TEXT' [deadstream, streak $((dstreak+1))]"
-            dlast="$now"; last_dead_sig="$dsig"; dstreak=$((dstreak + 1))
+            dlast="$now"; dstreak=$((dstreak + 1))
           else
             tmux send-keys -t "$SESSION" Escape
             sleep 0.3
@@ -350,9 +360,10 @@ watch_loop() {
               log "dead-stream fix confirmed — streak reset"
               dstreak=0
             else
+              log "dead-stream still dead after retry — will escalate"
               dstreak=$((dstreak + 1))
             fi
-            dlast="$now"; last_dead_sig="$dsig"
+            dlast="$now"
           fi
           stable=0; prev=""
           continue
