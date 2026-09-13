@@ -418,15 +418,16 @@ watch_loop() {
             continue
           fi ;;
         NET_FAIL)
-          # The message would be accepted and instantly fail, so there is
-          # nothing to gain by sending it. Hold off via `last` (which enforces
-          # the backoff) but deliberately do NOT set last_sig: the condition
-          # must stay eligible to retrigger, otherwise an unchanged screen
-          # would dedupe this forever and we'd never retry once the network
-          # came back. Observed live: a 12-minute outage that self-recovered.
-          log "network failing (stream=$hstream) — deferring [$class]"
-          last="$now"; stable=0; first_seen=0
-          continue ;;
+          # Recorded for diagnostics only — deliberately does NOT defer.
+          # An earlier version blocked injection here and that was wrong:
+          # "a request just failed" and "the network is down for good" are
+          # indistinguishable from the log, and the former is the common,
+          # transient case this tool exists to retry. Since a FAST-class
+          # error IS a network error, gating on it delayed every single
+          # recovery by 75s+ (observed live). Sustained outages are already
+          # handled by the escalating backoff, which self-recovered from a
+          # real 12-minute outage without help.
+          log "note: recent request failure (stream=$hstream) — retrying anyway [$class]" ;;
         SILENT)
           : ;;   # genuinely hung — proceed, Escape is warranted
         UNKNOWN)
