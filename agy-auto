@@ -194,21 +194,21 @@ live_error_tail() {
   { lines[NR] = $0 }
   END {
     if (num_div < 2) exit 0
-    top_div = div[num_div - 2]
-    bot_div = div[num_div - 1]
-
-    # Check prompt between dividers
-    prompt = ""
-    for (i = top_div + 1; i < bot_div; i++) {
-      if (lines[i] != "") prompt = prompt lines[i] " "
+    # Scan backward through divider pairs for the one that is actually the
+    # live input box (bare ">" or empty), instead of assuming it is always
+    # the last pair. agy can print further divider-bounded status footers
+    # below the real prompt (e.g. a background-task indicator) - blindly
+    # taking the last pair then mistakes that footer for the prompt and
+    # goes permanently blind to real errors sitting above the true box.
+    found = 0
+    for (k = num_div - 1; k >= 1; k--) {
+      bd = div[k]; td = div[k-1]
+      p = ""
+      for (i = td + 1; i < bd; i++) { if (lines[i] != "") p = p lines[i] " " }
+      sub(/^[[:space:]]+/, "", p); sub(/[[:space:]]+$/, "", p)
+      if (p == ">" || p == "") { top_div = td; bot_div = bd; found = 1; break }
     }
-    sub(/^[[:space:]]+/, "", prompt)
-    sub(/[[:space:]]+$/, "", prompt)
-
-    # If prompt contains user text (not empty and not bare ">"), user is typing -> do not touch
-    if (prompt != ">" && prompt != "") {
-      exit 0
-    }
+    if (!found) exit 0
 
     # Grab the last 2 non-empty lines immediately above the top divider
     count = 0
@@ -223,8 +223,8 @@ live_error_tail() {
   }
   '
 }
-# True iff the prompt box between the last two dividers is empty (bare ">").
-# Non-empty means you're mid-typing — never touch that.
+# True iff some divider-bounded section is the live input box (bare ">")
+# and it is empty. Non-empty means you are mid-typing — never touch that.
 prompt_empty() {
   awk '
   /^[[:space:]]*$/ { next }
@@ -232,11 +232,17 @@ prompt_empty() {
   { lines[NR] = $0 }
   END {
     if (num_div < 2) exit 1
-    top_div = div[num_div - 2]; bot_div = div[num_div - 1]
-    prompt = ""
-    for (i = top_div + 1; i < bot_div; i++) { if (lines[i] != "") prompt = prompt lines[i] " " }
-    sub(/^[[:space:]]+/, "", prompt); sub(/[[:space:]]+$/, "", prompt)
-    exit (prompt == ">" || prompt == "") ? 0 : 1
+    # Same backward scan as live_error_tail: do not assume the last divider
+    # pair is the prompt — a status footer below the real box (e.g. a
+    # background-task indicator) would otherwise be mistaken for it.
+    for (k = num_div - 1; k >= 1; k--) {
+      bd = div[k]; td = div[k-1]
+      p = ""
+      for (i = td + 1; i < bd; i++) { if (lines[i] != "") p = p lines[i] " " }
+      sub(/^[[:space:]]+/, "", p); sub(/[[:space:]]+$/, "", p)
+      if (p == ">" || p == "") exit 0
+    }
+    exit 1
   }
   '
 }
