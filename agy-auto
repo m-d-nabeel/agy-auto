@@ -77,6 +77,13 @@ MAX_STREAK="${AGY_AUTO_MAX_STREAK:-8}"
 RECOVER_SECS="${AGY_AUTO_RECOVER_SECS:-90}" # clean time that resets the streak
 SCROLLBACK="${AGY_AUTO_SCROLLBACK:-80}"
 CONFIRM_SECS="${AGY_AUTO_CONFIRM_SECS:-20}" # max wait after sending to confirm it worked
+HEALTH="${AGY_AUTO_HEALTH:-1}"             # consult agy's own log before injecting
+# How far back in agy's log counts as "recent work". Defaults to STALL_SECS
+# because the question being asked is exactly "was the backend alive during
+# the window in which the screen appeared frozen?" — so the two must match.
+# Backtested against 11 real stalls: 60s scores 10/11; 75s misclassifies all
+# six genuine hangs as working and would disable hang recovery entirely.
+WORK_WINDOW="${AGY_AUTO_WORK_WINDOW:-$STALL_SECS}"
 CONTINUE_TEXT="${AGY_AUTO_CONTINUE_TEXT:-continue}"
 # ---------------------------------------------------------------------------
 
@@ -95,6 +102,72 @@ log()    { printf '%(%H:%M:%S)T %s\n' -1 "$*" >>"$LOGF"; }
 alive()  { tmux has-session -t "$SESSION" 2>/dev/null; }
 screen() { tmux capture-pane -p -J -S "-$SCROLLBACK" -t "$SESSION" 2>/dev/null; }
 to_re()  { printf '%s' "$1" | grep -v '^[[:space:]]*$' | paste -sd'|'; }
+
+# --- agy's own log: the only signal that tells truth about what it's doing ----
+# The rendered screen cannot distinguish "hung" from "working but not painting"
+# from "network down" — all look identical. agy's internal log distinguishes
+# all of them, so we consult it before typing anything into a live session.
+
+# Locate the log the RUNNING agy has open. Deliberately not "newest by mtime":
+# agy rotates its log on restart, and mtime picks the wrong file the moment it
+# does (observed live). The process's own fd table is always correct.
+agy_log() {
+  local pid fd
+  pid="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)" || return 1
+  [[ -n "$pid" && -d "/proc/$pid/fd" ]] || return 1
+  fd="$(ls -l "/proc/$pid/fd" 2>/dev/null \
+        | grep -oE '/[^ ]*antigravity-cli/log/[^ ]+\.log' | head -1)"
+  [[ -n "$fd" && -r "$fd" ]] || return 1
+  printf '%s' "$fd"
+}
+
+# Report what agy is actually doing, as "<work_state> <stream_state>":
+#   work:   WORKING | SILENT | NET_FAIL | UNKNOWN
+#   stream: live | dead        (the agent_state feed that drives the spinner)
+# UNKNOWN means we could not read the log — callers must then behave exactly
+# as they did before this check existed, so a missing log can never make
+# things worse than not having the check at all.
+agy_health() {
+  local alog now work net tail_lines died started
+  alog="$(agy_log)" || { printf 'UNKNOWN live'; return; }
+  tail_lines="$(tail -n 4000 "$alog" 2>/dev/null)" || { printf 'UNKNOWN live'; return; }
+  [[ -n "$tail_lines" ]] || { printf 'UNKNOWN live'; return; }
+  now="$(printf '%(%H:%M:%S)T' -1)"
+
+  # Only lines within WORK_WINDOW seconds count. Housekeeping noise
+  # (credit polls, telemetry, config warnings) fires constantly in every
+  # state, so "the log changed" is meaningless — only real work counts.
+  local recent
+  recent="$(awk -v now="$now" -v win="$WORK_WINDOW" '
+    function secs(t,  p) { split(t, p, ":"); return p[1]*3600 + p[2]*60 + p[3] }
+    BEGIN { n = secs(now) }
+    match($0, /^[IWEF][0-9]+ ([0-9]{2}:[0-9]{2}:[0-9]{2})/, m) {
+      s = secs(m[1])
+      d = n - s
+      if (d < 0) d += 86400          # crossed midnight
+      if (d <= win) print
+    }' <<<"$tail_lines" 2>/dev/null)"
+
+  work=SILENT
+  if grep -qE 'streamGenerateContent|run\.go:[0-9]+\] Run: attempt|Forwarding user message' <<<"$recent"; then
+    work=WORKING
+  fi
+  # Network failure outranks: the message was accepted and instantly failed,
+  # so more injections cannot help until connectivity returns.
+  if grep -qE 'agent executor error|generating and executing: request failed' <<<"$recent"; then
+    work=NET_FAIL
+  fi
+
+  # The agent_state feed is latched-dead if its last failure came after the
+  # last start. While dead the spinner is stale, so it must not be trusted.
+  died="$(grep -nE 'Conversation update stream .* failed' <<<"$tail_lines" | tail -1 | cut -d: -f1)"
+  started="$(grep -nE 'Starting conversation update stream' <<<"$tail_lines" | tail -1 | cut -d: -f1)"
+  if [[ -n "$died" && ( -z "$started" || "$died" -gt "$started" ) ]]; then
+    printf '%s dead' "$work"
+  else
+    printf '%s live' "$work"
+  fi
+}
 # Extract candidate error lines immediately preceding the active prompt divider.
 # If the user is currently typing, or if normal output precedes the prompt, outputs nothing.
 live_error_tail() {
@@ -193,6 +266,7 @@ watch_loop() {
   local prev="" stable=0 streak=0 clean=0 last=0 last_sig="" first_seen=0
   local scr content tailtxt fast slow hits sig now waited need class err_id is_stall fixed
   local scr2 tailtxt2 csettle cprev cticks ccontent confirm_max
+  local health hwork hstream send_escape
   local fast_re slow_re clean_needed stall_ticks
   fast_re="$(to_re "$PATTERNS")"
   slow_re="$(to_re "$SLOW_PATTERNS")"
@@ -328,7 +402,40 @@ watch_loop() {
       continue
     fi
 
-    if (( is_stall )); then
+    # Ask agy what it's actually doing before typing at it. A frozen spinner
+    # means nothing on its own: it can mean the agent hung, OR that the
+    # agent_state feed died and the spinner is simply stale while the model
+    # keeps working. Injecting in the latter case sends Escape, which is
+    # agy's cancel action — destroying a live response.
+    send_escape=$is_stall
+    if (( HEALTH )); then
+      health="$(agy_health)"; hwork="${health%% *}"; hstream="${health##* }"
+      case "$hwork" in
+        WORKING)
+          if (( is_stall )); then
+            log "backend is working (stream=$hstream) — spinner is stale, not injecting"
+            stable=0; first_seen=0
+            continue
+          fi ;;
+        NET_FAIL)
+          # The message would be accepted and instantly fail, so there is
+          # nothing to gain by sending it. Hold off via `last` (which enforces
+          # the backoff) but deliberately do NOT set last_sig: the condition
+          # must stay eligible to retrigger, otherwise an unchanged screen
+          # would dedupe this forever and we'd never retry once the network
+          # came back. Observed live: a 12-minute outage that self-recovered.
+          log "network failing (stream=$hstream) — deferring [$class]"
+          last="$now"; stable=0; first_seen=0
+          continue ;;
+        SILENT)
+          : ;;   # genuinely hung — proceed, Escape is warranted
+        UNKNOWN)
+          : ;;   # no log readable: behave exactly as before this check existed
+      esac
+      [[ "$hstream" == dead ]] && log "note: agent_state stream is dead — spinner unreliable"
+    fi
+
+    if (( send_escape )); then
       tmux send-keys -t "$SESSION" Escape
       sleep 0.3
     fi
